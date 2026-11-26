@@ -9,15 +9,52 @@ function json(response, status, body) {
   response.end(JSON.stringify(body));
 }
 
+const topics = new Set(["delivery", "pricing", "other"]);
+const manualReview = { status: "manual_review", topic: null, draft: null };
+
 async function handleTriage(request, response) {
   const chunks = [];
   for await (const chunk of request) chunks.push(chunk);
-  const { text } = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  const result = JSON.parse(await classify(text));
-  return json(response, 200, { status: "ready", ...result });
+
+  let body;
+  try {
+    body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    return json(response, 400, { status: "invalid_input" });
+  }
+  if (typeof body?.text !== "string" || !body.text.trim()) {
+    return json(response, 400, { status: "invalid_input" });
+  }
+
+  const controller = new AbortController();
+  let timer;
+  try {
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new Error("AI timeout"));
+      }, 300);
+    });
+    const raw = await Promise.race([
+      classify(body.text.trim(), { signal: controller.signal }),
+      timeout,
+    ]);
+    const result = JSON.parse(raw);
+    if (!topics.has(result?.topic) ||
+        typeof result?.draft !== "string" || !result.draft.trim()) {
+      return json(response, 200, manualReview);
+    }
+    return json(response, 200, {
+      status: "ready", topic: result.topic, draft: result.draft.trim(),
+    });
+  } catch {
+    return json(response, 200, manualReview);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-createServer(async (request, response) => {
+export const server = createServer(async (request, response) => {
   if (request.method === "GET" && request.url === "/") {
     response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     response.end(html);
@@ -31,4 +68,4 @@ createServer(async (request, response) => {
   } catch {
     json(response, 500, { status: "server_error" });
   }
-}).listen(Number(process.env.PORT || 3000), "127.0.0.1");
+}).listen(Number(process.env.PORT ?? 3000), "127.0.0.1");
